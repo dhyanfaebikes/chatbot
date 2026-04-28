@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { GoogleGenerativeAI } from '@google/generative-ai'
+import Groq from 'groq-sdk'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -150,7 +151,14 @@ function App() {
   const [imagePreview, setImagePreview] = useState(null)
   const [editingChatId, setEditingChatId] = useState(null)
   const [editingTitle, setEditingTitle] = useState('')
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY
+  const [currentKeyIndex, setCurrentKeyIndex] = useState(0)
+  
+  const groqApiKey = import.meta.env.VITE_GROQ_API_KEY
+  const geminiApiKeys = [
+    import.meta.env.VITE_GEMINI_API_KEY_1,
+    import.meta.env.VITE_GEMINI_API_KEY_2
+  ].filter(Boolean)
+  
   const messagesEndRef = useRef(null)
   const fileInputRef = useRef(null)
 
@@ -241,48 +249,64 @@ function App() {
     removeImage()
     setLoading(true)
 
-    // Retry logic for 503 errors
-    const maxRetries = 3
-    let attempt = 0
-    
-    while (attempt < maxRetries) {
-      try {
-        const genAI = new GoogleGenerativeAI(apiKey)
-        const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
+    try {
+      let text
+      
+      if (imageToSend) {
+        // Use Gemini for images with key rotation
+        let success = false
+        let lastError = null
         
-        let result
-        if (imageToSend) {
-          const imagePart = await fileToGenerativePart(imageToSend)
-          result = await model.generateContent([userMessage || "What's in this image?", imagePart])
-        } else {
-          result = await model.generateContent(userMessage)
+        for (let i = 0; i < geminiApiKeys.length; i++) {
+          try {
+            const keyIndex = (currentKeyIndex + i) % geminiApiKeys.length
+            const genAI = new GoogleGenerativeAI(geminiApiKeys[keyIndex])
+            const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
+            
+            const imagePart = await fileToGenerativePart(imageToSend)
+            const result = await model.generateContent([userMessage || "What's in this image?", imagePart])
+            const response = await result.response
+            text = response.text()
+            
+            // Success! Update to next key for next time
+            setCurrentKeyIndex((keyIndex + 1) % geminiApiKeys.length)
+            success = true
+            break
+          } catch (error) {
+            lastError = error
+            continue // Try next key
+          }
         }
         
-        const response = await result.response
-        const text = response.text()
-        
-        updateChatMessages(currentChatId, [...messages, newUserMessage, { role: 'assistant', content: text }])
-        break // Success, exit retry loop
-        
-      } catch (error) {
-        attempt++
-        
-        // If it's a 503 and we have retries left, wait and retry
-        if (error.message.includes('503') && attempt < maxRetries) {
-          await new Promise(resolve => setTimeout(resolve, 2000 * attempt)) // Wait 2s, 4s, 6s
-          continue
+        if (!success) {
+          throw lastError || new Error('All Gemini API keys failed')
         }
+      } else {
+        // Use Groq for text chat
+        const groq = new Groq({
+          apiKey: groqApiKey,
+          dangerouslyAllowBrowser: true
+        })
         
-        // Otherwise show error
-        updateChatMessages(currentChatId, [...messages, newUserMessage, { 
-          role: 'assistant', 
-          content: `Error: ${error.message}. ${error.message.includes('503') ? 'The service is experiencing high demand. Please try again in a moment.' : ''}` 
-        }])
-        break
+        const chatCompletion = await groq.chat.completions.create({
+          messages: [{ role: 'user', content: userMessage }],
+          model: 'llama-3.3-70b-versatile',
+          temperature: 0.7,
+          max_tokens: 2048,
+        })
+        
+        text = chatCompletion.choices[0]?.message?.content || 'No response'
       }
+      
+      updateChatMessages(currentChatId, [...messages, newUserMessage, { role: 'assistant', content: text }])
+    } catch (error) {
+      updateChatMessages(currentChatId, [...messages, newUserMessage, { 
+        role: 'assistant', 
+        content: `Error: ${error.message}` 
+      }])
+    } finally {
+      setLoading(false)
     }
-    
-    setLoading(false)
   }
 
   const createNewChat = () => {
